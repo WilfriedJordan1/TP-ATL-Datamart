@@ -1,22 +1,25 @@
 import gc
 import os
 import sys
-
+from minio import Minio
+from minio.error import MinioException
+from io import BytesIO
 import pandas as pd
 from sqlalchemy import create_engine
 
 
-def write_data_postgres(dataframe: pd.DataFrame) -> bool:
-    """
-    Dumps a Dataframe to the DBMS engine
+def download_from_minio(minio_client: Minio, bucket: str, object_name: str) -> BytesIO:
+    """Télécharge un objet depuis Minio et renvoie le contenu sous forme de BytesIO."""
+    try:
+        response = minio_client.get_object(bucket, object_name)
+        content_bytes = BytesIO(response.read())
+        print(f"Downloaded {object_name} from Minio")
+        return content_bytes
+    except MinioException as err:
+        print(f"Error downloading {object_name} from Minio: {err}")
+        raise
 
-    Parameters:
-        - dataframe (pd.Dataframe) : The dataframe to dump into the DBMS engine
-
-    Returns:
-        - bool : True if the connection to the DBMS and the dump to the DBMS is successful, False if either
-        execution is failed
-    """
+def write_data_postgres(dataframe: pd.DataFrame, name: str) -> bool: 
     db_config = {
         "dbms_engine": "postgresql",
         "dbms_username": "postgres",
@@ -26,7 +29,7 @@ def write_data_postgres(dataframe: pd.DataFrame) -> bool:
         "dbms_database": "nyc_warehouse",
         "dbms_table": "nyc_raw"
     }
-
+    
     db_config["database_url"] = (
         f"{db_config['dbms_engine']}://{db_config['dbms_username']}:{db_config['dbms_password']}@"
         f"{db_config['dbms_ip']}:{db_config['dbms_port']}/{db_config['dbms_database']}"
@@ -35,8 +38,9 @@ def write_data_postgres(dataframe: pd.DataFrame) -> bool:
         engine = create_engine(db_config["database_url"])
         with engine.connect():
             success: bool = True
-            print("Connection successful! Processing parquet file")
+            print("Connection successful! Processing parquet file", name)
             dataframe.to_sql(db_config["dbms_table"], engine, index=False, if_exists='append')
+            print(f"Success to download the file {name} to the nyc_raw", name)
 
     except Exception as e:
         success: bool = False
@@ -65,21 +69,42 @@ def main() -> None:
     # Construct the relative path to the folder
     folder_path = os.path.join(script_dir, '..', '..', 'data', 'raw')
 
+    minio_client = Minio(
+        "http://127.0.0.1:9000/",
+        access_key="minio",
+        secret_key="minio123",
+        secure=False
+    )
+    bucket = "datalake"
+    prefix = "raw/"
+
     parquet_files = [f for f in os.listdir(folder_path) if
-                     f.lower().endswith('.parquet') and os.path.isfile(os.path.join(folder_path, f))]
+                     f.lower().endswith('.datalake') and os.path.isfile(os.path.join(folder_path, f))]
+    dataframes = []  # Liste pour stocker les DataFrames
 
     for parquet_file in parquet_files:
-        parquet_df: pd.DataFrame = pd.read_parquet(os.path.join(folder_path, parquet_file), engine='pyarrow')
-
+        # Utilisation de la fonction download_from_minio pour récupérer les données
+        content_bytes = download_from_minio(minio_client, bucket, prefix + parquet_file)
+        
+        # Utilisation de pandas pour lire les données depuis BytesIO
+        parquet_df = pd.read_parquet(content_bytes, engine='pyarrow')
+        
         clean_column_name(parquet_df)
-        if not write_data_postgres(parquet_df):
-            del parquet_df
-            gc.collect()
-            return
+        dataframes.append(parquet_df)  # Stocke le DataFrame dans la liste
 
-        del parquet_df
-        gc.collect()
+    # Exemple : Concaténer tous les DataFrames dans un seul DataFrame
+    concatenated_df = pd.concat(dataframes, ignore_index=True)
+
+    # Charger le DataFrame concaténé dans la base de données
+    if not write_data_postgres(concatenated_df):
+        print("Échec lors de l'écriture dans la base de données.")
+
+    # Libérer la mémoire en supprimant les DataFrames
+    del dataframes
+    del concatenated_df
+    gc.collect()
 
 
 if __name__ == '__main__':
     sys.exit(main())
+    
